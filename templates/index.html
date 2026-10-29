@@ -3,46 +3,36 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FuelPulse — Painel de Combustíveis</title>
+  <title>FuelPulse — Preços de Combustíveis</title>
 
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/css/style.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
-<header class="topbar">
+<header>
   <div>
     <h1>⛽ FuelPulse</h1>
-    <p>Monitor de preços de combustíveis no Brasil e no mundo</p>
+    <p>Painel interativo de preços de combustíveis no Brasil e no mundo</p>
   </div>
 
   <div class="status-area">
-    <span id="status-anp" class="badge">ANP: carregando</span>
-    <span id="status-mundo" class="badge">Mundo: carregando</span>
+    <span id="status" class="badge">Carregando...</span>
     <button id="btn-atualizar">Atualizar</button>
   </div>
 </header>
 
 <main>
-  <section class="kpis" id="kpis"></section>
-
   <section class="painel">
-    <div class="painel-topo">
-      <h2>Brasil</h2>
-      <select id="filtro-regiao">
-        <option value="todos">Todas as regiões</option>
-      </select>
-    </div>
-
+    <h2>Preços no Brasil</h2>
     <div id="cards-brasil" class="grid"></div>
-    <div class="grafico-box">
-      <canvas id="grafico-regioes"></canvas>
-    </div>
   </section>
 
   <section class="painel">
-    <h2>Detalhamento por estado</h2>
-    <div id="tabela-estados"></div>
+    <h2>Comparação por região</h2>
+    <div class="grafico-box">
+      <canvas id="grafico-regioes"></canvas>
+    </div>
   </section>
 
   <section class="painel">
@@ -60,9 +50,9 @@
 </div>
 
 <footer>
-  <p>FuelPulse Dados: ANP e OpenVan camp Projeto educacional e demonstrativo</p>
+  <p>FuelPulse · Fontes: ANP e OpenVan.camp</p>
 </footer>
 
-<script src="/static/js/dashboard.js"></script>
+<script src="/js/dashboard.js"></script>
 </body>
 </html>
