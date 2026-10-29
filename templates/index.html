@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FuelPulse — Painel de Combustíveis</title>
+
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div>
+    <h1>⛽ FuelPulse</h1>
+    <p>Monitor de preços de combustíveis no Brasil e no mundo</p>
+  </div>
+
+  <div class="status-area">
+    <span id="status-anp" class="badge">ANP: carregando</span>
+    <span id="status-mundo" class="badge">Mundo: carregando</span>
+    <button id="btn-atualizar">Atualizar</button>
+  </div>
+</header>
+
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <section class="painel">
+    <div class="painel-topo">
+      <h2>Brasil</h2>
+      <select id="filtro-regiao">
+        <option value="todos">Todas as regiões</option>
+      </select>
+    </div>
+
+    <div id="cards-brasil" class="grid"></div>
+    <div class="grafico-box">
+      <canvas id="grafico-regioes"></canvas>
+    </div>
+  </section>
+
+  <section class="painel">
+    <h2>Detalhamento por estado</h2>
+    <div id="tabela-estados"></div>
+  </section>
+
+  <section class="painel">
+    <h2>Ranking global</h2>
+    <div id="tabela-mundo"></div>
+  </section>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <button id="fechar-modal">✕</button>
+    <h3 id="modal-titulo"></h3>
+    <div id="modal-conteudo"></div>
+  </div>
+</div>
+
+<footer>
+  <p>FuelPulse Dados: ANP e OpenVan camp Projeto educacional e demonstrativo</p>
+</footer>
+
+<script src="/static/js/dashboard.js"></script>
+</body>
+</html>
