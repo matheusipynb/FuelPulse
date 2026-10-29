@@ -1,683 +1,352 @@
-from flask import Flask, jsonify, render_template_string
+import io
+import math
+import re
+import time
+import threading
+import unicodedata
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+import requests
+import openpyxl
+import xlrd
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-PAGINA = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f5f7fb">
-  <title>FuelPulse | Monitor de combustíveis</title>
+ANP_PAGE = (
+    "https://www.gov.br/anp/pt-br/assuntos/"
+    "precos-e-defesa-da-concorrencia/precos/"
+    "levantamento-de-precos-de-combustiveis-ultimas-semanas-pesquisadas"
+)
 
-  <style>
-    :root {
-      color-scheme: light;
-      --fundo: #f5f7fb;
-      --branco: #ffffff;
-      --texto: #17243c;
-      --suave: #64748b;
-      --azul: #2563eb;
-      --borda: #e6ebf2;
-      --verde: #059669;
-      --sombra: 0 8px 32px rgba(30, 55, 90, .045);
+CACHE_TTL = 3600
+CACHE = {}
+LOCK = threading.Lock()
+
+PAISES = {
+    "germany": "Alemanha",
+    "france": "França",
+    "spain": "Espanha",
+    "italy": "Itália",
+}
+
+PRODUTOS = {
+    "GASOLINA COMUM": "Gasolina comum",
+    "GASOLINA": "Gasolina comum",
+    "GASOLINA C COMUM": "Gasolina comum",
+    "GASOLINA ADITIVADA": "Gasolina aditivada",
+    "ETANOL HIDRATADO": "Etanol hidratado",
+    "ETANOL": "Etanol hidratado",
+    "OLEO DIESEL S10": "Diesel S10",
+    "DIESEL S10": "Diesel S10",
+    "OLEO DIESEL S500": "Diesel S500",
+    "DIESEL S500": "Diesel S500",
+    "OLEO DIESEL": "Diesel",
+    "GNV": "GNV",
+    "GLP": "GLP",
+}
+
+REGIOES = {
+    "NORTE", "NORDESTE", "CENTRO OESTE", "SUDESTE", "SUL"
+}
+
+
+def normalizar(valor):
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.upper().replace("-", " ")
+    return re.sub(r"s+", " ", texto).strip()
+
+
+def agora():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def numero(valor):
+    if valor is None or isinstance(valor, bool):
+        return None
+    try:
+        if isinstance(valor, str):
+            valor = valor.strip().replace("R$", "").replace(" ", "")
+            if "," in valor:
+                valor = valor.replace(".", "").replace(",", ".")
+        resultado = float(valor)
+        return resultado if math.isfinite(resultado) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def baixar(url):
+    resposta = requests.get(
+        url,
+        timeout=(8, 25),
+        headers={"User-Agent": "FuelPulse/1.0"},
+    )
+    resposta.raise_for_status()
+    return resposta
+
+
+def obter_cache(chave, carregar):
+    atual = time.time()
+    anterior = CACHE.get(chave)
+
+    if anterior and atual - anterior["tempo"] < CACHE_TTL:
+        return dict(anterior["dados"], cache_antigo=False)
+
+    with LOCK:
+        anterior = CACHE.get(chave)
+        if anterior and time.time() - anterior["tempo"] < CACHE_TTL:
+            return dict(anterior["dados"], cache_antigo=False)
+
+        try:
+            dados = carregar()
+            CACHE[chave] = {"tempo": time.time(), "dados": dados}
+            return dict(dados, cache_antigo=False)
+        except Exception:
+            if anterior:
+                return dict(
+                    anterior["dados"],
+                    cache_antigo=True,
+                    aviso="Falha ao atualizar; exibindo a última consulta em memória."
+                )
+            raise
+
+
+def descobrir_planilha():
+    html = baixar(ANP_PAGE).text
+    soup = BeautifulSoup(html, "html.parser")
+    candidatos = []
+
+    for link in soup.find_all("a", href=True):
+        titulo = normalizar(link.get_text(" ", strip=True))
+        href = urljoin(ANP_PAGE, link["href"])
+        caminho = urlparse(href).path.lower()
+
+        if (
+            "PRECOS MEDIOS SEMANAIS" in titulo
+            and re.search(r".xlsx?(?:/.*)?$", caminho)
+            and urlparse(href).hostname == "www.gov.br"
+        ):
+            anteriores = link.find_all_previous(string=True, limit=100)
+            contexto = " ".join(str(s) for s in reversed(anteriores))
+            periodos = re.findall(
+                r"(d{1,2}/d{1,2}/d{4})s*as*"
+                r"(d{1,2}/d{1,2}/d{4})",
+                contexto
+            )
+
+            if periodos:
+                inicio, fim = periodos[-1]
+                try:
+                    ordem = datetime.strptime(fim, "%d/%m/%Y")
+                except ValueError:
+                    continue
+                candidatos.append((ordem, href, f"{inicio} a {fim}"))
+
+    if not candidatos:
+        raise ValueError(
+            "Não foi possível localizar a planilha semanal na página da ANP."
+        )
+
+    candidatos.sort(key=lambda item: item[0], reverse=True)
+    _, url, periodo = candidatos[0]
+    return url, periodo
+
+
+def ler_abas(conteudo):
+    if conteudo[:2] == b"PK":
+        arquivo = openpyxl.load_workbook(
+            io.BytesIO(conteudo), read_only=True, data_only=True
+        )
+        try:
+            for aba in arquivo.worksheets:
+                yield aba.title, list(aba.iter_rows(values_only=True))
+        finally:
+            arquivo.close()
+    else:
+        arquivo = xlrd.open_workbook(file_contents=conteudo)
+        for aba in arquivo.sheets():
+            yield aba.name, [
+                aba.row_values(i) for i in range(aba.nrows)
+            ]
+
+
+def detectar_cabecalho(linha):
+    textos = [normalizar(c) for c in linha]
+    mapa = {}
+
+    for i, texto in enumerate(textos):
+        if texto in ("PRODUTO", "COMBUSTIVEL"):
+            mapa["produto"] = i
+        elif "PRECO" in texto and "MEDIO" in texto and "REVENDA" in texto:
+            mapa["medio"] = i
+        elif "PRECO" in texto and "MINIMO" in texto and "REVENDA" in texto:
+            mapa["minimo"] = i
+        elif "PRECO" in texto and "MAXIMO" in texto and "REVENDA" in texto:
+            mapa["maximo"] = i
+        elif (
+            ("POSTOS" in texto or "OBSERVACOES" in texto)
+            and ("NUMERO" in texto or texto == "POSTOS")
+        ):
+            mapa["postos"] = i
+        elif texto in ("REGIAO", "REGIOES"):
+            mapa["regiao"] = i
+        elif texto in ("ESTADO", "ESTADOS", "UF"):
+            mapa["estado"] = i
+        elif texto in ("MUNICIPIO", "MUNICIPIOS"):
+            mapa["municipio"] = i
+        elif "UNIDADE" in texto:
+            mapa["unidade"] = i
+
+    return mapa if "produto" in mapa and "medio" in mapa else None
+
+
+def interpretar_planilha(conteudo):
+    registros = []
+    vistos = set()
+
+    for nome_aba, linhas in ler_abas(conteudo):
+        aba = normalizar(nome_aba)
+        cabecalho = None
+        ultima_localidade = None
+
+        for linha in linhas:
+            novo = detectar_cabecalho(linha)
+            if novo:
+                cabecalho = novo
+                ultima_localidade = None
+                continue
+
+            if not cabecalho:
+                continue
+
+            def campo(nome):
+                indice = cabecalho.get(nome)
+                return (
+                    linha[indice]
+                    if indice is not None and indice < len(linha)
+                    else None
+                )
+
+            produto = normalizar(campo("produto"))
+            nome_produto = PRODUTOS.get(produto)
+            medio = numero(campo("medio"))
+
+            if not nome_produto or medio is None or medio <= 0:
+                continue
+
+            # Evita misturar dados municipais, estaduais e nacionais.
+            if "municipio" in cabecalho:
+                continue
+            elif "estado" in cabecalho:
+                nivel = "Estado"
+                local = campo("estado")
+            elif "regiao" in cabecalho:
+                nivel = "Região"
+                local = campo("regiao")
+            elif "BRASIL" in aba or "NACIONAL" in aba:
+                nivel = "Brasil"
+                local = "Brasil"
+            else:
+                continue
+
+            local = str(local).strip() if local is not None else ""
+            if not local:
+                local = ultima_localidade
+            if not local:
+                continue
+
+            ultima_localidade = local
+
+            if normalizar(local) == "BRASIL":
+                nivel, local = "Brasil", "Brasil"
+
+            unidade = str(campo("unidade") or "").strip()
+            if not unidade:
+                unidade = "R$/m³" if nome_produto == "GNV" else (
+                    "R$/13 kg" if nome_produto == "GLP" else "R$/litro"
+                )
+
+            chave = (nivel, normalizar(local), nome_produto)
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+
+            registros.append({
+                "nivel": nivel,
+                "local": local.title() if local != "Brasil" else local,
+                "produto": nome_produto,
+                "medio": medio,
+                "minimo": numero(campo("minimo")),
+                "maximo": numero(campo("maximo")),
+                "postos": numero(campo("postos")),
+                "unidade": unidade,
+            })
+
+    if not registros:
+        raise ValueError(
+            "Planilha baixada, mas os cabeçalhos não foram reconhecidos. "
+            "O formato da ANP pode ter mudado."
+        )
+
+    return registros
+
+
+def carregar_brasil():
+    url, periodo = descobrir_planilha()
+    conteudo = baixar(url).content
+    registros = interpretar_planilha(conteudo)
+
+    return {
+        "fonte": "ANP — Levantamento de Preços de Combustíveis",
+        "pagina_fonte": ANP_PAGE,
+        "arquivo": url,
+        "periodo": periodo,
+        "consultado_em": agora(),
+        "registros": registros,
     }
 
-    * { box-sizing: border-box; }
 
-    body {
-      margin: 0;
-      background: var(--fundo);
-      color: var(--texto);
-      font-family: system-ui, -apple-system, sans-serif;
-      line-height: 1.5;
+def carregar_pais(slug):
+    url = f"https://fuelwide.com/api/fuel-prices/{slug}"
+    bruto = baixar(url).json()
+    observacoes = []
+
+    for item in bruto.get("observations", []):
+        if item.get("fuelType") not in ("petrol95", "diesel", "lpg"):
+            continue
+        preco = numero(item.get("price"))
+        if preco is None:
+            continue
+
+        fonte = item.get("source") or {}
+
+        observacoes.append({
+            "produto": {
+                "petrol95": "Gasolina 95",
+                "diesel": "Diesel",
+                "lpg": "GLP",
+            }[item["fuelType"]],
+            "preco": preco,
+            "moeda": item.get("currency"),
+            "unidade": item.get("unit"),
+            "data": item.get("observedAt"),
+            "atrasado": bool(item.get("stale")),
+            "atribuicao": item.get("attribution") or fonte.get("name"),
+            "fonte_url": fonte.get("url"),
+            "base": item.get("priceBasis"),
+        })
+
+    if not observacoes:
+        raise ValueError("O provedor não retornou preços disponíveis para este país.")
+
+    return {
+        "pais": PAISES[slug],
+        "consultado_em": agora(),
+        "observacoes": observacoes,
     }
-
-    button, select { font: inherit; }
-    button { cursor: pointer; }
-
-    button:focus-visible, select:focus-visible, a:focus-visible {
-      outline: 3px solid #93c5fd;
-      outline-offset: 4px;
-    }
-
-    .topbar {
-      background: rgba(255, 255, 255, .96);
-      border-bottom: 1px solid var(--borda);
-    }
-
-    .nav {
-      max-width: 1160px;
-      margin: auto;
-      padding: 18px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-
-    .marca {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-size: 22px;
-      font-weight: 800;
-      letter-spacing: -.8px;
-    }
-
-    .logo {
-      width: 39px;
-      height: 39px;
-      display: grid;
-      place-items: center;
-      background: var(--azul);
-      color: white;
-      border-radius: 13px;
-      font-size: 22px;
-      box-shadow: 0 5px 12px #2563eb22;
-    }
-
-    .marca span { color: var(--azul); }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 7px 11px;
-      border-radius: 30px;
-      background: #ecfdf5;
-      color: #047857;
-      font-size: 12px;
-      font-weight: 650;
-      white-space: nowrap;
-    }
-
-    .ponto {
-      width: 7px;
-      height: 7px;
-      background: #10b981;
-      border-radius: 50%;
-    }
-
-    main {
-      max-width: 1160px;
-      padding: 34px 24px;
-      margin: auto;
-    }
-
-    .hero {
-      position: relative;
-      overflow: hidden;
-      padding: 32px;
-      background: linear-gradient(120deg, #eff6ff, #f0fdfa);
-      border: 1px solid #dce9f6;
-      border-radius: 24px;
-      margin-bottom: 24px;
-    }
-
-    .etiqueta {
-      color: var(--azul);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 1.6px;
-      text-transform: uppercase;
-    }
-
-    h1 {
-      margin: 9px 0;
-      max-width: 640px;
-      font-size: clamp(27px, 5vw, 39px);
-      line-height: 1.16;
-      letter-spacing: -1.4px;
-    }
-
-    .hero p {
-      max-width: 590px;
-      margin: 12px 0 20px;
-      color: #52647c;
-      font-size: 14px;
-    }
-
-    .hero-tags {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    .hero-tags span {
-      padding: 6px 11px;
-      background: #ffffffb5;
-      border: 1px solid #ffffff;
-      border-radius: 8px;
-      font-size: 12px;
-      color: #475569;
-    }
-
-    .aviso {
-      display: flex;
-      align-items: flex-start;
-      gap: 11px;
-      padding: 15px 18px;
-      margin-bottom: 28px;
-      border: 1px solid #fde5ae;
-      border-radius: 14px;
-      background: #fffbeb;
-      color: #80591b;
-      font-size: 13px;
-    }
-
-    .aviso p { margin: 0; }
-
-    .cabecalho-secao {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin: 26px 0 16px;
-    }
-
-    h2 {
-      margin: 0;
-      font-size: 19px;
-      letter-spacing: -.5px;
-    }
-
-    .subtitulo {
-      margin: 4px 0 0;
-      font-size: 12px;
-      color: var(--suave);
-    }
-
-    select {
-      max-width: 100%;
-      background: white;
-      border: 1px solid var(--borda);
-      color: var(--texto);
-      padding: 10px 12px;
-      border-radius: 10px;
-      font-size: 13px;
-    }
-
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 16px;
-    }
-
-    .card {
-      text-align: left;
-      width: 100%;
-      color: inherit;
-      background: var(--branco);
-      border: 1px solid var(--borda);
-      border-radius: 18px;
-      padding: 21px;
-      box-shadow: var(--sombra);
-      transition: transform .2s, box-shadow .2s, border-color .2s;
-      animation: entrada .45s ease both;
-    }
-
-    .card:nth-child(2) { animation-delay: .06s; }
-    .card:nth-child(3) { animation-delay: .12s; }
-    .card:nth-child(4) { animation-delay: .18s; }
-
-    .card:hover {
-      transform: translateY(-4px);
-      border-color: #b5cdfb;
-      box-shadow: 0 12px 30px #2563eb12;
-    }
-
-    .card-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 18px;
-    }
-
-    .icone {
-      display: grid;
-      place-items: center;
-      width: 42px;
-      height: 42px;
-      border-radius: 13px;
-      background: #eff6ff;
-      color: #2563eb;
-      font-weight: 800;
-      font-size: 17px;
-    }
-
-    .icone.verde { background: #ecfdf5; color: #059669; }
-    .icone.roxo { background: #f5f3ff; color: #7c3aed; }
-    .icone.laranja { background: #fff7ed; color: #ea580c; }
-
-    .seta { color: #94a3b8; font-size: 19px; }
-    .nome { font-size: 13px; color: #52647c; }
-    .preco { margin: 4px 0; font-size: 32px; font-weight: 750; }
-    .unidade { font-size: 12px; color: var(--suave); }
-
-    .card-rodape {
-      margin-top: 18px;
-      padding-top: 12px;
-      border-top: 1px solid #f0f3f8;
-      font-size: 11px;
-      color: var(--suave);
-    }
-
-    .colunas {
-      display: grid;
-      grid-template-columns: 1.35fr 1fr;
-      gap: 20px;
-      margin-top: 25px;
-    }
-
-    .painel {
-      background: white;
-      border: 1px solid var(--borda);
-      border-radius: 20px;
-      padding: 24px;
-      box-shadow: var(--sombra);
-    }
-
-    .painel h2 { font-size: 17px; }
-
-    .vazio {
-      min-height: 200px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      border: 1px dashed #dbe3ef;
-      border-radius: 14px;
-      margin-top: 20px;
-      padding: 24px 18px;
-      background: #fafcff;
-    }
-
-    .vazio-icone {
-      font-size: 28px;
-      color: #94a3b8;
-      margin-bottom: 9px;
-    }
-
-    .vazio h3 { font-size: 14px; margin: 0 0 6px; }
-    .vazio p { max-width: 340px; font-size: 12px; color: var(--suave); margin: 0; }
-
-    .linha {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 0;
-      border-bottom: 1px solid #f0f3f8;
-      font-size: 13px;
-    }
-
-    .linha:last-child { border-bottom: none; }
-    .linha span:last-child { color: var(--suave); font-size: 12px; }
-
-    .metodologia {
-      margin-top: 24px;
-      padding: 21px 24px;
-      border: 1px solid var(--borda);
-      border-radius: 18px;
-      background: #edf2f8;
-    }
-
-    .metodologia h2 { font-size: 15px; }
-    .metodologia p { margin: 8px 0 0; font-size: 12px; color: #52647c; }
-
-    footer {
-      display: flex;
-      justify-content: space-between;
-      gap: 15px;
-      flex-wrap: wrap;
-      padding: 24px 0 0;
-      font-size: 11px;
-      color: var(--suave);
-    }
-
-    footer a { color: var(--azul); text-decoration: none; }
-
-    dialog {
-      width: min(460px, calc(100% - 32px));
-      max-height: calc(100vh - 48px);
-      border: 1px solid var(--borda);
-      border-radius: 23px;
-      padding: 28px;
-      color: var(--texto);
-      box-shadow: 0 24px 90px #17243c33;
-    }
-
-    dialog::backdrop {
-      background: #15243b66;
-      backdrop-filter: blur(4px);
-    }
-
-    .modal-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 15px;
-    }
-
-    .fechar {
-      background: #f1f5f9;
-      border: none;
-      border-radius: 10px;
-      width: 34px;
-      height: 34px;
-      color: #475569;
-    }
-
-    .modal-descricao {
-      margin: 18px 0;
-      color: var(--suave);
-      font-size: 14px;
-    }
-
-    .nota {
-      margin: 18px 0 0;
-      padding: 13px;
-      background: #eff6ff;
-      border-radius: 12px;
-      font-size: 12px;
-      color: #315b9f;
-    }
-
-    @keyframes entrada {
-      from { opacity: 0; transform: translateY(12px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    @media (max-width: 900px) {
-      .cards { grid-template-columns: repeat(2, 1fr); }
-      .colunas { grid-template-columns: 1fr; }
-    }
-
-    @media (max-width: 520px) {
-      .nav { padding: 16px; }
-      .marca { font-size: 20px; }
-      main { padding: 20px 16px; }
-      .hero { padding: 24px 21px; border-radius: 20px; }
-      .cabecalho-secao { align-items: flex-start; flex-direction: column; }
-      select { width: 100%; }
-      .cards { gap: 12px; }
-      .card { padding: 16px; }
-      .nome { font-size: 12px; }
-      .preco { font-size: 29px; }
-      .card-rodape { font-size: 10px; }
-      .painel { padding: 20px; }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation: none !important;
-        transition: none !important;
-      }
-    }
-  </style>
-</head>
-
-<body>
-  <header class="topbar">
-    <nav class="nav" aria-label="Cabeçalho">
-      <div class="marca">
-        <div class="logo" aria-hidden="true">↗</div>
-        <div>Fuel<span>Pulse</span></div>
-      </div>
-
-      <div class="badge">
-        <span class="ponto" aria-hidden="true"></span>
-        Prévia visual
-      </div>
-    </nav>
-  </header>
-
-  <main>
-    <section class="hero">
-      <div class="etiqueta">Inteligência em combustíveis</div>
-      <h1>Mais clareza para acompanhar os preços.</h1>
-      <p>
-        Um espaço para consultar combustíveis, explorar regiões
-        e acompanhar o mercado brasileiro e internacional.
-      </p>
-      <div class="hero-tags">
-        <span>Brasil e mundo</span>
-        <span>Comparação regional</span>
-        <span>Informações por combustível</span>
-      </div>
-    </section>
-
-    <aside class="aviso">
-      <span aria-hidden="true">ⓘ</span>
-      <p>
-        Painel em desenvolvimento. A integração com as fontes de
-        preços ainda não está ativa. Nenhum valor fictício é exibido.
-      </p>
-    </aside>
-
-    <section aria-labelledby="titulo-brasil">
-      <div class="cabecalho-secao">
-        <div>
-          <h2 id="titulo-brasil">Panorama de combustíveis</h2>
-          <p class="subtitulo" id="local-selecionado">
-            Brasil · Visão nacional
-          </p>
-        </div>
-
-        <select id="regiao" aria-label="Selecionar região">
-          <option value="Brasil">Brasil · Todas as regiões</option>
-          <option>Norte</option>
-          <option>Nordeste</option>
-          <option>Centro-Oeste</option>
-          <option>Sudeste</option>
-          <option>Sul</option>
-        </select>
-      </div>
-
-      <div class="cards">
-        <button class="card" type="button" data-combustivel="gasolina">
-          <div class="card-top">
-            <span class="icone" aria-hidden="true">G</span>
-            <span class="seta" aria-hidden="true">↗</span>
-          </div>
-          <div class="nome">Gasolina comum</div>
-          <div class="preco">—</div>
-          <div class="unidade">R$/litro</div>
-          <div class="card-rodape">Ver informações do combustível</div>
-        </button>
-
-        <button class="card" type="button" data-combustivel="s10">
-          <div class="card-top">
-            <span class="icone verde" aria-hidden="true">D</span>
-            <span class="seta" aria-hidden="true">↗</span>
-          </div>
-          <div class="nome">Diesel S10</div>
-          <div class="preco">—</div>
-          <div class="unidade">R$/litro</div>
-          <div class="card-rodape">Ver informações do combustível</div>
-        </button>
-
-        <button class="card" type="button" data-combustivel="s500">
-          <div class="card-top">
-            <span class="icone laranja" aria-hidden="true">D</span>
-            <span class="seta" aria-hidden="true">↗</span>
-          </div>
-          <div class="nome">Diesel S500</div>
-          <div class="preco">—</div>
-          <div class="unidade">R$/litro</div>
-          <div class="card-rodape">Ver informações do combustível</div>
-        </button>
-
-        <button class="card" type="button" data-combustivel="etanol">
-          <div class="card-top">
-            <span class="icone roxo" aria-hidden="true">E</span>
-            <span class="seta" aria-hidden="true">↗</span>
-          </div>
-          <div class="nome">Etanol hidratado</div>
-          <div class="preco">—</div>
-          <div class="unidade">R$/litro</div>
-          <div class="card-rodape">Ver informações do combustível</div>
-        </button>
-      </div>
-    </section>
-
-    <div class="colunas">
-      <section class="painel">
-        <h2>Evolução de preços</h2>
-        <p class="subtitulo">Espaço reservado ao histórico de pesquisas</p>
-
-        <div class="vazio">
-          <div class="vazio-icone" aria-hidden="true">▥</div>
-          <h3>Histórico ainda não conectado</h3>
-          <p>
-            O gráfico será exibido quando houver uma série de
-            preços reais disponível. Não usamos curvas simuladas.
-          </p>
-        </div>
-      </section>
-
-      <section class="painel">
-        <h2>Informações da consulta</h2>
-        <p class="subtitulo">Transparência sobre os dados exibidos</p>
-
-        <div class="linha">
-          <span>Abrangência</span>
-          <span id="abrangencia">Brasil</span>
-        </div>
-        <div class="linha">
-          <span>Fonte de preços</span>
-          <span>Não conectada</span>
-        </div>
-        <div class="linha">
-          <span>Período da pesquisa</span>
-          <span>Indisponível</span>
-        </div>
-        <div class="linha">
-          <span>Última sincronização</span>
-          <span>Não realizada</span>
-        </div>
-      </section>
-    </div>
-
-    <section class="painel" style="margin-top: 24px">
-      <h2>Mercado internacional</h2>
-      <p class="subtitulo">Comparação entre países</p>
-      <div class="vazio" style="min-height: 155px">
-        <div class="vazio-icone" aria-hidden="true">◎</div>
-        <h3>Comparação global em preparação</h3>
-        <p>
-          Os preços deverão incluir moeda, unidade e data de
-          referência antes de serem comparados.
-        </p>
-      </div>
-    </section>
-
-    <section class="metodologia">
-      <h2>Como interpretar o painel</h2>
-      <p>
-        O símbolo “—” indica que o preço não está disponível,
-        e não que o combustível custa zero. A escolha de uma região
-        altera o contexto da interface, mas ainda não consulta preços.
-      </p>
-    </section>
-
-    <footer>
-      <span>FuelPulse · Monitor de combustíveis</span>
-      <a href="/api/saude">Status da aplicação ↗</a>
-    </footer>
-  </main>
-
-  <dialog id="detalhes" aria-labelledby="modal-titulo">
-    <div class="modal-top">
-      <h2 id="modal-titulo">Combustível</h2>
-      <button class="fechar" id="fechar" aria-label="Fechar detalhes">✕</button>
-    </div>
-
-    <p class="modal-descricao" id="modal-descricao"></p>
-
-    <div class="linha">
-      <span>Localidade</span>
-      <span id="modal-regiao">Brasil</span>
-    </div>
-    <div class="linha">
-      <span>Preço médio</span>
-      <span>Indisponível</span>
-    </div>
-    <div class="linha">
-      <span>Unidade</span>
-      <span>R$/litro</span>
-    </div>
-    <div class="linha">
-      <span>Período de referência</span>
-      <span>Indisponível</span>
-    </div>
-
-    <p class="nota">
-      Este card está pronto visualmente. Os valores serão preenchidos
-      após a integração com uma fonte de dados validada.
-    </p>
-  </dialog>
-
-  <script>
-    const combustiveis = {
-      gasolina: {
-        nome: "Gasolina comum",
-        descricao: "Detalhamento reservado à gasolina comum."
-      },
-      s10: {
-        nome: "Diesel S10",
-        descricao: "Detalhamento reservado ao diesel S10, separado do diesel S500."
-      },
-      s500: {
-        nome: "Diesel S500",
-        descricao: "Detalhamento reservado ao diesel S500, separado do diesel S10."
-      },
-      etanol: {
-        nome: "Etanol hidratado",
-        descricao: "Detalhamento reservado ao etanol hidratado."
-      }
-    };
-
-    const seletor = document.getElementById("regiao");
-    const dialog = document.getElementById("detalhes");
-
-    seletor.addEventListener("change", () => {
-      const local = seletor.value;
-      document.getElementById("local-selecionado").textContent =
-        local === "Brasil" ? "Brasil · Visão nacional" : local + " · Visão regional";
-      document.getElementById("abrangencia").textContent = local;
-    });
-
-    document.querySelectorAll("[data-combustivel]").forEach(card => {
-      card.addEventListener("click", () => {
-        const item = combustiveis[card.dataset.combustivel];
-        document.getElementById("modal-titulo").textContent = item.nome;
-        document.getElementById("modal-descricao").textContent = item.descricao;
-        document.getElementById("modal-regiao").textContent = seletor.value;
-        dialog.showModal();
-      });
-    });
-
-    document.getElementById("fechar").addEventListener("click", () => {
-      dialog.close();
-    });
-
-    dialog.addEventListener("click", event => {
-      const area = dialog.getBoundingClientRect();
-      if (
-        event.clientX < area.left || event.clientX > area.right ||
-        event.clientY < area.top || event.clientY > area.bottom
-      ) {
-        dialog.close();
-      }
-    });
-  </script>
-</body>
-</html>
-"""
 
 
 @app.get("/")
@@ -687,12 +356,532 @@ def home():
 
 @app.get("/api/saude")
 def saude():
-    return jsonify({
-        "status": "ok",
-        "servico": "FuelPulse",
-        "versao": "visual-claro-01",
-        "dados_de_precos": "nao_conectados"
-    })
+    return jsonify(
+        status="ok",
+        servico="FuelPulse",
+        versao="dados-01",
+        hora=agora(),
+    )
+
+
+@app.get("/api/precos")
+def api_precos():
+    try:
+        dados = obter_cache("brasil", carregar_brasil)
+        return jsonify(dados)
+    except Exception as erro:
+        app.logger.exception("Falha na integração ANP")
+        return jsonify(
+            erro="Não foi possível consultar os preços da ANP.",
+            detalhe=str(erro),
+            fonte=ANP_PAGE,
+        ), 503
+
+
+@app.get("/api/mundo")
+def api_mundo():
+    slug = request.args.get("pais", "germany")
+    if slug not in PAISES:
+        return jsonify(erro="País não suportado."), 400
+
+    try:
+        dados = obter_cache(
+            f"pais:{slug}",
+            lambda: carregar_pais(slug)
+        )
+        return jsonify(dados)
+    except Exception as erro:
+        app.logger.exception("Falha na integração internacional")
+        return jsonify(
+            erro="Preços internacionais indisponíveis.",
+            detalhe=str(erro),
+        ), 503
+
+
+PAGINA = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#eaf4ff">
+<title>FuelPulse — Preços de combustíveis</title>
+<style>
+:root {
+  color-scheme:light;
+  --azul:#176fe0;
+  --texto:#173958;
+  --suave:#5e7891;
+  --borda:#cde1f6;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0;
+  font-family:system-ui,-apple-system,sans-serif;
+  background:linear-gradient(145deg,#eff8ff,#e3efff);
+  color:var(--texto);
+  min-height:100vh;
+}
+button,select { font:inherit; }
+button { cursor:pointer; }
+a { color:var(--azul); }
+header { background:#ffffffd9; border-bottom:1px solid var(--borda); }
+nav,main { max-width:1160px; margin:auto; padding:22px; }
+nav { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.marca { font-size:25px; font-weight:850; letter-spacing:-1px; }
+.marca span { color:var(--azul); }
+.selo {
+  font-size:12px; color:#24649e; background:#e4f1ff;
+  border-radius:30px; padding:7px 12px;
+}
+.hero {
+  padding:30px; border-radius:24px;
+  background:linear-gradient(120deg,#d8ebff,#f2faff);
+  border:1px solid #bddafa; margin-bottom:22px;
+}
+h1 { font-size:clamp(27px,5vw,39px); line-height:1.15; letter-spacing:-1px; margin:10px 0; }
+.hero p { color:var(--suave); font-size:14px; max-width:620px; }
+.etiqueta { font-size:11px; letter-spacing:1.8px; color:var(--azul); font-weight:800; }
+h2 { margin:0; font-size:20px; }
+h3 { margin:0; font-size:15px; }
+.sub { font-size:12px; color:var(--suave); margin:6px 0; }
+.painel {
+  background:#ffffffed; border:1px solid var(--borda);
+  border-radius:20px; padding:24px; margin-bottom:22px;
+  box-shadow:0 8px 28px #2266aa08;
+}
+.controles { display:flex; flex-wrap:wrap; gap:10px; margin:18px 0; }
+select,button.acao {
+  padding:11px 13px; border-radius:11px;
+  border:1px solid var(--borda); background:#f6faff; color:var(--texto);
+}
+button.acao { background:var(--azul); color:white; border-color:var(--azul); }
+button:disabled { opacity:.6; cursor:wait; }
+.status {
+  padding:13px 15px; background:#eaf4ff; color:#365f85;
+  border-radius:12px; font-size:13px; margin:14px 0;
+  overflow-wrap:anywhere;
+}
+.status.erro { background:#fff0ef; color:#a03434; }
+.cards { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+.card {
+  text-align:left; background:linear-gradient(145deg,#fff,#f3f9ff);
+  border:1px solid var(--borda); border-radius:17px;
+  padding:20px; color:var(--texto);
+  transition:transform .2s,box-shadow .2s; animation:entrar .35s both;
+}
+.card:hover { transform:translateY(-4px); box-shadow:0 12px 25px #1677e819; }
+.icone {
+  width:39px; height:39px; background:#e3f0ff; border-radius:12px;
+  display:grid; place-items:center; color:var(--azul);
+  font-weight:800; margin-bottom:15px;
+}
+.preco { font-size:29px; font-weight:800; color:#155faa; margin:7px 0; }
+.unidade { font-size:12px; color:var(--suave); }
+.rodape-card { margin-top:15px; padding-top:11px; border-top:1px solid #dfebf7; font-size:11px; }
+.barra { margin-top:14px; height:6px; background:#e5effa; border-radius:9px; overflow:hidden; }
+.barra span { display:block; height:100%; background:#58a4f4; }
+.tabela { overflow:auto; margin-top:18px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { padding:13px 10px; text-align:left; border-bottom:1px solid #e6eff8; white-space:nowrap; }
+th { color:var(--suave); font-size:12px; }
+.nota { font-size:12px; line-height:1.7; color:var(--suave); }
+details { font-size:12px; margin-top:10px; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+footer { font-size:12px; color:var(--suave); padding:5px 0 25px; }
+dialog {
+  width:min(480px,calc(100% - 32px)); max-height:85vh;
+  border:1px solid var(--borda); border-radius:22px; padding:25px;
+  color:var(--texto); background:#fbfdff;
+}
+dialog::backdrop { background:#12385870; backdrop-filter:blur(4px); }
+.modal-top { display:flex; justify-content:space-between; gap:14px; align-items:center; }
+.fechar { border:0; background:#e6f1ff; color:#315e88; padding:8px 12px; border-radius:9px; }
+.linha { display:flex; justify-content:space-between; gap:14px; padding:13px 0; border-bottom:1px solid #e3edf8; font-size:13px; }
+@keyframes entrar { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){
+  nav,main{padding:16px}
+  .hero,.painel{padding:20px}
+  .card{padding:15px}
+  .preco{font-size:25px}
+  .controles select{width:100%}
+}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+<header>
+  <nav>
+    <div class="marca">↗ Fuel<span>Pulse</span></div>
+    <span class="selo">Monitor de combustíveis</span>
+  </nav>
+</header>
+
+<main>
+<section class="hero">
+  <div class="etiqueta">BRASIL E MERCADO INTERNACIONAL</div>
+  <h1>Preços com contexto.<br>Informação com fonte.</h1>
+  <p>
+    Consulte médias de combustíveis, explore localidades e veja
+    o período da pesquisa. Sem preços simulados.
+  </p>
+</section>
+
+<section class="painel">
+  <h2>Preços no Brasil</h2>
+  <p class="sub">Fonte: ANP · Levantamento semanal de preços</p>
+
+  <div class="controles">
+    <select id="nivel" aria-label="Abrangência"></select>
+    <select id="local" aria-label="Localidade"></select>
+    <button class="acao" id="atualizar">Consultar atualização</button>
+  </div>
+
+  <div class="status" id="status" role="status">Consultando a ANP...</div>
+  <div class="cards" id="cards"></div>
+
+  <p class="nota" id="metadados"></p>
+  <a id="arquivo" target="_blank" rel="noopener" hidden>Baixar planilha oficial ↗</a>
+
+  <details id="diagnostico" hidden>
+    <summary>Detalhes do erro de integração</summary>
+    <pre id="erro-detalhe"></pre>
+  </details>
+</section>
+
+<section class="painel">
+  <h2>Comparação entre localidades</h2>
+  <p class="sub">Ordenação pela média publicada para o combustível selecionado</p>
+  <div class="controles">
+    <select id="produto" aria-label="Combustível para comparação"></select>
+  </div>
+  <div class="tabela">
+    <table>
+      <thead><tr><th>Localidade</th><th>Média</th><th>Mínimo</th><th>Máximo</th><th>Unidade</th></tr></thead>
+      <tbody id="comparacao"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="painel">
+  <h2>Mercado internacional</h2>
+  <p class="sub">Países selecionados · Provedor: FuelWide</p>
+  <div class="controles">
+    <select id="pais" aria-label="País">
+      <option value="germany">Alemanha</option>
+      <option value="france">França</option>
+      <option value="spain">Espanha</option>
+      <option value="italy">Itália</option>
+    </select>
+    <button class="acao" id="atualizar-mundo">Consultar país</button>
+  </div>
+  <div id="status-mundo" class="status" role="status">Selecione um país e consulte os preços.</div>
+  <div class="tabela">
+    <table>
+      <thead><tr><th>Combustível</th><th>Preço</th><th>Moeda/unidade</th><th>Referência</th></tr></thead>
+      <tbody id="mundo"></tbody>
+    </table>
+  </div>
+  <div id="creditos" class="nota"></div>
+</section>
+
+<section class="painel nota">
+  <h2>Metodologia e atualização</h2>
+  <p>
+    Brasil: médias, mínimos e máximos são lidos da planilha da ANP,
+    sem recalcular a média nacional a partir dos estados.
+    O período da pesquisa é diferente do horário da consulta.
+  </p>
+  <p>
+    A aplicação procura a planilha mais recente e mantém cache em
+    memória por até uma hora por instância. Com a página aberta,
+    consulta novamente a cada 15 minutos. Não há uma tarefa
+    persistente executando quando ninguém acessa o site.
+  </p>
+  <p>
+    Internacional: moeda, unidade, referência e crédito são informados
+    pelo provedor. Gasolina 95 internacional não é apresentada como
+    produto idêntico à gasolina comum brasileira. Não há conversão
+    cambial nem ranking conjunto entre Brasil e exterior.
+  </p>
+  <p>
+    Não há histórico persistente nesta versão. Se uma fonte mudar de
+    formato ou ficar indisponível, o painel informa a falha.
+    Campos ausentes aparecem como “—”, nunca como zero.
+  </p>
+</section>
+
+<footer>FuelPulse · <a href="/api/saude">Status da aplicação</a></footer>
+</main>
+
+<dialog id="modal" aria-labelledby="titulo-modal">
+  <div class="modal-top">
+    <h2 id="titulo-modal"></h2>
+    <button class="fechar" id="fechar" aria-label="Fechar">✕</button>
+  </div>
+  <div id="conteudo-modal"></div>
+</dialog>
+
+<script>
+let dados = null;
+const el = id => document.getElementById(id);
+
+function texto(tag, conteudo, classe) {
+  const item = document.createElement(tag);
+  item.textContent = conteudo;
+  if (classe) item.className = classe;
+  return item;
+}
+
+function numero(valor) {
+  return valor == null ? "—" : Number(valor).toLocaleString("pt-BR", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 3
+  });
+}
+
+function data(valor) {
+  if (!valor) return "—";
+  const d = new Date(valor);
+  return Number.isNaN(d.getTime()) ? valor : d.toLocaleString("pt-BR");
+}
+
+function opcoes(elemento, valores, escolhido) {
+  elemento.replaceChildren();
+  valores.forEach(valor => {
+    const opcao = new Option(valor, valor);
+    elemento.add(opcao);
+  });
+  if (valores.includes(escolhido)) elemento.value = escolhido;
+}
+
+function status(id, mensagem, erro = false) {
+  el(id).textContent = mensagem;
+  el(id).className = "status" + (erro ? " erro" : "");
+}
+
+async function consultar(url) {
+  const resposta = await fetch(url, {cache: "no-store"});
+  const conteudo = await resposta.json();
+  if (!resposta.ok) {
+    const erro = new Error(conteudo.erro || "Falha na consulta.");
+    erro.detalhe = conteudo.detalhe || "";
+    throw erro;
+  }
+  return conteudo;
+}
+
+function preencherLocais() {
+  const antigo = el("local").value;
+  const locais = [...new Set(
+    dados.registros
+      .filter(r => r.nivel === el("nivel").value)
+      .map(r => r.local)
+  )].sort((a,b) => a.localeCompare(b, "pt-BR"));
+
+  opcoes(el("local"), locais, antigo);
+  renderizar();
+}
+
+function abrirDetalhes(registro) {
+  el("titulo-modal").textContent = registro.produto;
+  const container = el("conteudo-modal");
+  container.replaceChildren();
+
+  const itens = [
+    ["Localidade", registro.local],
+    ["Preço médio", numero(registro.medio)],
+    ["Preço mínimo", numero(registro.minimo)],
+    ["Preço máximo", numero(registro.maximo)],
+    ["Unidade", registro.unidade],
+    ["Postos/observações", registro.postos == null ? "—" : numero(registro.postos)],
+    ["Pesquisa", dados.periodo],
+    ["Fonte", "ANP"]
+  ];
+
+  itens.forEach(([chave, valor]) => {
+    const linha = texto("div", "", "linha");
+    linha.append(texto("span", chave), texto("span", valor));
+    container.append(linha);
+  });
+
+  el("modal").showModal();
+}
+
+function renderizar() {
+  if (!dados) return;
+
+  const registros = dados.registros.filter(
+    r => r.nivel === el("nivel").value && r.local === el("local").value
+  );
+
+  el("cards").replaceChildren();
+
+  registros.forEach((r, i) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "card";
+    card.style.animationDelay = `${i * .04}s`;
+
+    card.append(
+      texto("div", r.produto.charAt(0), "icone"),
+      texto("h3", r.produto),
+      texto("div", numero(r.medio), "preco"),
+      texto("div", r.unidade, "unidade"),
+      texto("div", "Toque para ver mínimo, máximo e fonte ↗", "rodape-card")
+    );
+
+    card.onclick = () => abrirDetalhes(r);
+    el("cards").append(card);
+  });
+
+  const antigo = el("produto").value;
+  const produtos = [...new Set(
+    dados.registros.filter(r => r.nivel === el("nivel").value)
+      .map(r => r.produto)
+  )].sort();
+
+  opcoes(el("produto"), produtos, antigo);
+  comparar();
+}
+
+function comparar() {
+  if (!dados) return;
+
+  const linhas = dados.registros.filter(
+    r => r.nivel === el("nivel").value &&
+         r.produto === el("produto").value
+  ).sort((a,b) => a.medio - b.medio);
+
+  el("comparacao").replaceChildren();
+
+  linhas.forEach(r => {
+    const tr = document.createElement("tr");
+    [
+      r.local, numero(r.medio), numero(r.minimo),
+      numero(r.maximo), r.unidade
+    ].forEach(valor => tr.append(texto("td", valor)));
+    el("comparacao").append(tr);
+  });
+}
+
+async function carregarBrasil() {
+  el("atualizar").disabled = true;
+  status("status", "Consultando a publicação mais recente da ANP...");
+  el("diagnostico").hidden = true;
+
+  try {
+    dados = await consultar("/api/precos");
+
+    const niveis = ["Brasil", "Região", "Estado"].filter(
+      nivel => dados.registros.some(r => r.nivel === nivel)
+    );
+
+    opcoes(el("nivel"), niveis, el("nivel").value);
+    preencherLocais();
+
+    status(
+      "status",
+      dados.cache_antigo
+        ? dados.aviso
+        : "Dados carregados · Pesquisa: " + dados.periodo,
+      dados.cache_antigo
+    );
+
+    el("metadados").textContent =
+      "Fonte: " + dados.fonte +
+      " · Consulta ao provedor: " + data(dados.consultado_em);
+
+    el("arquivo").href = dados.arquivo;
+    el("arquivo").hidden = false;
+  } catch (erro) {
+    status(
+      "status",
+      erro.message + (dados ? " Os dados anteriores continuam visíveis." : ""),
+      true
+    );
+    el("diagnostico").hidden = false;
+    el("erro-detalhe").textContent = erro.detalhe || erro.message;
+  } finally {
+    el("atualizar").disabled = false;
+  }
+}
+
+async function carregarMundo() {
+  el("atualizar-mundo").disabled = true;
+  el("mundo").replaceChildren();
+  el("creditos").replaceChildren();
+  status("status-mundo", "Consultando o país selecionado...");
+
+  try {
+    const resultado = await consultar(
+      "/api/mundo?pais=" + encodeURIComponent(el("pais").value)
+    );
+
+    status(
+      "status-mundo",
+      resultado.pais + " · " +
+      (resultado.cache_antigo ? resultado.aviso : "Consulta concluída"),
+      resultado.cache_antigo
+    );
+
+    resultado.observacoes.forEach(r => {
+      const tr = document.createElement("tr");
+      [
+        r.produto,
+        numero(r.preco),
+        (r.moeda || "—") + "/" + (r.unidade || "—"),
+        (r.data || "—") + (r.atrasado ? " · Dado atrasado" : "")
+      ].forEach(valor => tr.append(texto("td", valor)));
+
+      el("mundo").append(tr);
+
+      const credito = texto(
+        "p",
+        r.produto + ": " + (r.atribuicao || "Fonte não informada") +
+        " · Base: " + (r.base || "não informada")
+      );
+
+      if (r.fonte_url && /^https?:\\/\\//i.test(r.fonte_url)) {
+        const link = texto("a", " · Fonte original ↗");
+        link.href = r.fonte_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        credito.append(link);
+      }
+      el("creditos").append(credito);
+    });
+  } catch (erro) {
+    status("status-mundo", erro.message + " " + (erro.detalhe || ""), true);
+  } finally {
+    el("atualizar-mundo").disabled = false;
+  }
+}
+
+el("nivel").onchange = preencherLocais;
+el("local").onchange = renderizar;
+el("produto").onchange = comparar;
+el("atualizar").onclick = carregarBrasil;
+el("atualizar-mundo").onclick = carregarMundo;
+el("pais").onchange = carregarMundo;
+el("fechar").onclick = () => el("modal").close();
+
+carregarBrasil();
+carregarMundo();
+
+setInterval(() => {
+  if (!document.hidden) {
+    carregarBrasil();
+    carregarMundo();
+  }
+}, 15 * 60 * 1000);
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
