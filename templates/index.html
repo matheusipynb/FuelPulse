@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#eaf4ff">
+  <meta name="description"
+        content="Consulte preços de combustíveis no Brasil e nos estados, com dados da ANP.">
+  <title>FuelPulse Brasil — Preços de combustíveis</title>
+
+  <link rel="stylesheet" href="/public/css/style.css">
+  <script src="/public/js/dashboard.js" defer></script>
+</head>
+
+<body>
+<header>
+  <nav>
+    <a class="marca" href="/" aria-label="FuelPulse, página inicial">
+      ↗ Fuel<span>Pulse</span>
+    </a>
+    <span class="selo">Brasil e estados</span>
+  </nav>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="etiqueta">MONITOR BRASILEIRO DE COMBUSTÍVEIS</div>
+    <h1>Os preços do Brasil,<br>com mais clareza.</h1>
+    <p>
+      Consulte a média nacional e os preços por estado.
+      Dados da ANP com período de referência, unidade e fonte.
+    </p>
+  </section>
+
+  <section class="painel">
+    <h2>Panorama de preços</h2>
+    <p class="sub">
+      Escolha Brasil ou uma unidade da federação.
+      A primeira consulta estadual pode demorar.
+    </p>
+
+    <div class="controles">
+      <select id="local" aria-label="Selecionar localidade">
+        <option value="BR">Brasil — Média nacional</option>
+        {% for uf, nome in estados.items() %}
+        <option value="{{ uf }}">{{ nome }} — {{ uf }}</option>
+        {% endfor %}
+      </select>
+      <button class="acao" id="consultar" type="button">
+        Consultar fonte
+      </button>
+    </div>
+
+    <div id="status" class="status" role="status">
+      Preparando consulta...
+    </div>
+
+    <div class="cards" id="cards"></div>
+
+    <p class="nota" id="referencia"></p>
+    <a id="arquivo" hidden target="_blank" rel="noopener">
+      Abrir arquivo oficial da ANP ↗
+    </a>
+
+    <details id="diagnostico" hidden>
+      <summary>Detalhes da integração</summary>
+      <pre id="erro"></pre>
+    </details>
+  </section>
+
+  <section class="painel">
+    <h2>Comparação entre estados</h2>
+    <p class="sub">
+      Do menor para o maior preço médio, utilizando o mesmo
+      período da pesquisa estadual.
+    </p>
+
+    <div class="controles">
+      <select id="produto" aria-label="Combustível para comparação">
+        <option>Gasolina comum</option>
+        <option>Gasolina aditivada</option>
+        <option>Diesel S10</option>
+        <option>Diesel S500</option>
+        <option>Etanol hidratado</option>
+        <option>GNV</option>
+        <option>GLP</option>
+      </select>
+
+      <button class="acao" id="comparar" type="button">
+        Carregar comparação
+      </button>
+    </div>
+
+    <div class="status" id="status-estados" role="status">
+      Toque em “Carregar comparação” para consultar o arquivo estadual.
+    </div>
+
+    <div class="tabela">
+      <table>
+        <caption class="sr-only">Comparação dos preços estaduais</caption>
+        <thead>
+          <tr>
+            <th scope="col">Estado</th>
+            <th scope="col">Média</th>
+            <th scope="col">Mínimo</th>
+            <th scope="col">Máximo</th>
+            <th scope="col">Unidade</th>
+          </tr>
+        </thead>
+        <tbody id="tabela"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="painel nota">
+    <h2>Sobre os dados</h2>
+    <p>
+      Fonte: ANP — Levantamento de Preços de Combustíveis.
+      A média nacional é lida diretamente da planilha nacional,
+      sem calcular uma média simples dos estados.
+    </p>
+    <p>
+      O painel apresenta o último período reconhecido em cada arquivo.
+      As pesquisas nacional e estadual podem ter datas diferentes.
+      Verifique sempre a referência exibida.
+    </p>
+    <p>
+      O cache permanece em memória por até seis horas por instância.
+      Com a página aberta e visível, as consultas são repetidas
+      a cada 15 minutos, respeitando o cache.
+    </p>
+    <p>
+      Não há coleta agendada sem acessos, banco de dados ou histórico
+      persistente nesta versão. Consultar o servidor não significa
+      que a ANP publicou uma nova pesquisa.
+    </p>
+    <p>
+      “—” indica dado ausente, não preço zero.
+      GLP e GNV podem ter unidades diferentes dos combustíveis líquidos.
+    </p>
+  </section>
+
+  <footer>
+    <span>FuelPulse Brasil</span>
+    <a href="/status">Status da aplicação ↗</a>
+  </footer>
+</main>
+
+<dialog id="modal" aria-labelledby="modal-titulo">
+  <div class="modal-top">
+    <h2 id="modal-titulo"></h2>
+    <button class="fechar" id="fechar" type="button" aria-label="Fechar detalhes">
+      ✕
+    </button>
+  </div>
+  <div id="modal-conteudo"></div>
+</dialog>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#eaf4ff">
+  <title>Status — FuelPulse Brasil</title>
+
+  <link rel="stylesheet" href="/public/css/style.css">
+  <script src="/public/js/status.js" defer></script>
+</head>
+
+<body>
+<main class="pagina-status">
+  <p><a href="/">← Voltar ao dashboard</a></p>
+
+  <section class="hero">
+    <div class="etiqueta">CENTRAL DE STATUS</div>
+    <h1>FuelPulse Brasil</h1>
+
+    <div class="status" id="situacao" role="status">
+      Verificando aplicação...
+    </div>
+
+    <button class="acao" id="verificar" type="button">
+      Verificar novamente
+    </button>
+  </section>
+
+  <section class="painel">
+    <h2>Informações do servidor</h2>
+    <div id="informacoes"></div>
+  </section>
+
+  <section class="painel">
+    <h2>Consultas mantidas em memória</h2>
+    <div id="fontes"></div>
+    <p class="nota">
+      O cache pertence a cada instância da aplicação.
+      Ele pode desaparecer quando a instância é reiniciada.
+    </p>
+  </section>
+
+  <section class="painel nota">
+    <h2>O que este teste verifica?</h2>
+    <p>
+      Esta página consulta apenas a rota de saúde.
+      Ela não baixa as planilhas nem verifica a disponibilidade
+      dos preços da ANP.
+    </p>
+    <p>
+      O tempo exibido inclui rede e processamento.
+      Não é uma medição isolada da velocidade do servidor.
+    </p>
+  </section>
+
+  <footer>
+    <a href="/">Dashboard</a>
+    <a href="/api/saude">Resposta técnica em JSON ↗</a>
+  </footer>
+</main>
+</body>
+</html>
