@@ -307,8 +307,6 @@ O cache é local a cada instância. A página de status pode ter sido atendida p
 - [ ] Comparação entre períodos equivalentes.
 - [ ] Exportação de consultas em CSV.
 - [ ] Testes automatizados para os formatos da ANP.
-- [ ] Separação do HTML, CSS e JavaScript em arquivos próprios.
-- [ ] Monitoramento de falhas e da idade dos dados.
 
 ## 👨‍💻 Autor
 
